@@ -51,6 +51,12 @@ class OpenWakeWordEventHandler(AsyncEventHandler):
         self.converter = AudioChunkConverter(rate=16000, width=2, channels=1)
         self.oww_features = OpenWakeWordFeatures.from_builtin()
         self.audio_buffer = bytes()
+
+        # Rolling pre-wake audio buffer (2 seconds by default)
+        self.ring_size_seconds = 2.0
+        self.ring_bytes = int( self.ring_size_seconds * self.converter.rate * self.converter.width * self.converter.channels )
+        self.ring_buffer = bytearray()
+        
         self.detectors: Dict[str, Detector] = {}
         self.audio_timestamp = 0
 
@@ -113,6 +119,7 @@ class OpenWakeWordEventHandler(AsyncEventHandler):
             _LOGGER.debug("Receiving audio from client: %s", self.client_id)
 
             # Reset
+            self.ring_buffer.clear()
             self.audio_timestamp = 0
             self.oww_features.reset()
             for detector in self.detectors.values():
@@ -122,6 +129,14 @@ class OpenWakeWordEventHandler(AsyncEventHandler):
                 detector.oww_model.reset()
         elif AudioChunk.is_type(event.type):
             chunk = self.converter.convert(AudioChunk.from_event(event))
+            # --- PRE-WAKE AUDIO RING BUFFER ---
+            self.ring_buffer.extend(chunk.audio)
+
+            # Trim buffer to max size
+            if len(self.ring_buffer) > self.ring_bytes:
+                excess = len(self.ring_buffer) - self.ring_bytes
+                del self.ring_buffer[:excess]
+
             for features in self.oww_features.process_streaming(chunk.audio):
                 for detector in self.detectors.values():
                     skip_detector = (detector.last_triggered is not None) and (
@@ -151,6 +166,27 @@ class OpenWakeWordEventHandler(AsyncEventHandler):
                         _LOGGER.debug(
                             "Detected %s at %s", detector.id, self.audio_timestamp
                         )
+                        # --- SAVE PRE-WAKE AUDIO TO WAV ---
+                        try:
+                            import wave
+                            from pathlib import Path
+
+                            out_dir = Path("wake_recordings")
+                            out_dir.mkdir(parents=True, exist_ok=True)
+
+                            timestamp = time.monotonic_ns()
+                            wav_path = out_dir / f"wake_{detector.id}_{timestamp}.wav"
+
+                            with wave.open(str(wav_path), "wb") as wav_file:
+                                wav_file.setnchannels(self.converter.channels)
+                                wav_file.setsampwidth(self.converter.width)
+                                wav_file.setframerate(self.converter.rate)
+                                wav_file.writeframes(bytes(self.ring_buffer))
+
+                            _LOGGER.info("Saved wake audio → %s (%d bytes)",
+                                         wav_path, len(self.ring_buffer))
+                        except Exception:
+                            _LOGGER.exception("Failed to save wake audio")
 
             self.audio_timestamp += chunk.milliseconds
         elif AudioStop.is_type(event.type):
